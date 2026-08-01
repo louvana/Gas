@@ -1,0 +1,95 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.7.0
+  restart: always
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: "/opt/airflow/dags/git-sync/current"
+  volumes:
+    - airflow-dags-volume:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+
+services:
+  # 1. Git-Sync Service
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.1.0
+    user: "0:0"
+    restart: always
+    environment:
+      GITSYNC_REPO: "https://github.com/louvana/Gas.git"
+      GITSYNC_BRANCH: "main"
+      GITSYNC_PERIOD: "60s"
+      GITSYNC_DEPTH: "1"
+      GITSYNC_ROOT: "/dags/git-sync"
+      GITSYNC_DEST: "repo"
+      GITSYNC_LINK: "current"
+      GITSYNC_ADD_USER: "true"
+      GITSYNC_CHANGE_PERMISSIONS: "1"
+      GITSYNC_SSL_VERIFY: "false"
+      GITSYNC_SYNC_TIMEOUT: "300s"
+      GITSYNC_FAIL_THRESHOLD: "0"
+    volumes:
+      - airflow-dags-volume:/dags
+    healthcheck:
+      test: ["CMD-SHELL", "test -L /dags/git-sync/current"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  # 2. Database
+  postgres:
+    image: postgres:13
+    restart: always
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./initialisation.sql:/docker-entrypoint-initdb.d/initialisation.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+     
+  # 3. Initialization Service (Initializes DB & Admin User then exits)
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    command: >
+      bash -c "airflow db init &&
+               airflow users create --username airflow --password airflow --firstname airflow --lastname airflow--role Admin --email admin@example.com || true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # 4. Airflow Scheduler
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      git-sync:
+        condition: service_healthy
+
+  # 5. Airflow Webserver
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8085:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      git-sync:
+        condition: service_healthy
+
+volumes:
+  airflow-dags-volume:
+  postgres-db-volume:
