@@ -41,16 +41,28 @@ def gasoil_etl_pipeline():
         data = json.loads(raw_data_json)
         df = pd.DataFrame(data)
 
-        # Drop missing prices and cast types
+        # 1. Drop missing prices and convert types
         df = df.dropna(subset=['prix']).copy()
         df['prix'] = df['prix'].astype(float)
-        df['station_id'] = df['station_id'].astype(int)
         df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-        df['ingested_at'] = datetime.now().isoformat()
+
+        # 2. Rename columns to match PostgreSQL table schema exactly
+        df = df.rename(columns={
+            'ville': 'region',
+            'produit': 'product_type',
+            'prix': 'price_usd_per_gallon'
+        })
+
+        # 3. Add default values for composite Primary Keys (grade, source)
+        df['grade'] = 'Standard'
+        df['source'] = 'Mock_API'
+
+        # 4. Drop columns that do NOT exist in the SQL table
+        df = df.drop(columns=['station_id'])
 
         return df.to_json(orient='records')
 
-    @task()
+    @task(execution_timeout=timedelta(minutes=5))
     def load_to_postgres(cleaned_data_json: str):
         logger.info("Chargement dans PostgreSQL...")
         df = pd.read_json(cleaned_data_json, orient='records')
@@ -59,21 +71,22 @@ def gasoil_etl_pipeline():
             logger.warning("Aucune donnée à charger.")
             return
 
-        postgres_hook = PostgresHook(postgres_conn_id='postgres_gasoil_db')
-        engine = postgres_hook.get_sqlalchemy_engine()
+        # Fetch Postgres hook and get SQLAlchemy engine
+        hook = PostgresHook(postgres_conn_id="postgres_gasoil_db")
+        engine = hook.get_sqlalchemy_engine()
 
-        # Open connection block to ensure clean transaction commit
-        with engine.begin() as conn:
-            df.to_sql(
-                name='stg_fact_gasoil_prices',
-                con=conn,
-                if_exists='append',
-                index=False
-            )
-        logger.info("Insertion réussie !")
+        # Execute using a context manager to auto-commit and prevent socket hanging
+        with engine.begin() as connection:
+            df.to_sql('gasoil_prices', con=connection, if_exists='append', index=False)
 
+        # Cleanup engine connection pool
+        engine.dispose()
+        logger.info("Données chargées avec succès dans gasoil_prices !")
+
+    # Pipeline task dependencies
     raw_json = extract_raw_data()
     cleaned_json = transform_data(raw_json)
     load_to_postgres(cleaned_json)
 
+# Instantiate the DAG
 gasoil_pipeline_dag = gasoil_etl_pipeline()
