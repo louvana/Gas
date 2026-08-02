@@ -2,6 +2,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 import pandas as pd
+from sqlalchemy import create_engine
 
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -71,12 +72,19 @@ def gasoil_etl_pipeline():
             logger.warning("Aucune donnée à charger.")
             return
 
+        # 1. Fetch connection details explicitly from Airflow Connection
         hook = PostgresHook(postgres_conn_id="postgres_gasoil_db")
-        engine = hook.get_sqlalchemy_engine()
+        conn = hook.get_connection("postgres_gasoil_db")
 
+        # 2. Build explicit, clean SQLAlchemy connection URI (bypassing __extra__ issue)
+        db_uri = f"postgresql+psycopg2://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
+        engine = create_engine(db_uri)
+
+        # 3. Insert DataFrame into PostgreSQL using context manager
         with engine.begin() as connection:
             df.to_sql('gasoil_prices', con=connection, if_exists='append', index=False)
 
+        # 4. Clean up connection pool
         engine.dispose()
         logger.info("Données chargées avec succès dans gasoil_prices !")
 
