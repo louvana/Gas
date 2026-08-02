@@ -53,7 +53,7 @@ def gasoil_etl_pipeline():
             'prix': 'price_usd_per_gallon'
         })
 
-        # 3. Add default values for composite Primary Keys (grade, source)
+        # 3. Add default values for composite Primary Keys
         df['grade'] = 'Standard'
         df['source'] = 'Mock_API'
 
@@ -71,15 +71,12 @@ def gasoil_etl_pipeline():
             logger.warning("Aucune donnée à charger.")
             return
 
-        # Fetch Postgres hook and get SQLAlchemy engine
         hook = PostgresHook(postgres_conn_id="postgres_gasoil_db")
         engine = hook.get_sqlalchemy_engine()
 
-        # Execute using a context manager to auto-commit and prevent socket hanging
         with engine.begin() as connection:
             df.to_sql('gasoil_prices', con=connection, if_exists='append', index=False)
 
-        # Cleanup engine connection pool
         engine.dispose()
         logger.info("Données chargées avec succès dans gasoil_prices !")
 
