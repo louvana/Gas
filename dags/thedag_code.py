@@ -26,9 +26,9 @@ RETRY_BACKOFF_SECONDS = 2
 FUEL_KEYWORDS = ["FUEL", "GAS", "ENGINE"]
 
 
-# =============================================================================
+
 # Helper Functions (API Request & Database Upsert Logic)
-# =============================================================================
+
 
 def get_pg_connection():
     """Retrieves standard psycopg2 connection object from Airflow Connection."""
@@ -101,9 +101,8 @@ def safe_float(value):
         return None
 
 
-# =============================================================================
+
 # Airflow DAG Definition
-# =============================================================================
 
 @dag(
     dag_id='gasoil_intelligence_etl_v2',
