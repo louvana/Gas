@@ -5,21 +5,24 @@ import requests
 from dotenv import load_dotenv
 from database import get_conn, upsert
 
-# Charge le fichier .env
+# Load .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
 load_dotenv(dotenv_path)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-EIA_KEY = os.environ.get("EIA_API_KEY")
-EIA_BASE = os.environ.get("EIA_BASE_URL")
+EIA_KEY = os.environ.get("EIA_API_KEY") or os.environ.get("Crude_oil_key")
+EIA_BASE = os.environ.get("EIA_BASE_URL", "https://api.eia.gov/v2")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
 
 
 def _get_with_retries(url, params, max_retries=MAX_RETRIES):
+    if not params.get("api_key"):
+        raise ValueError("EIA API Key is missing. Ensure EIA_API_KEY is set in .env")
+        
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -34,8 +37,9 @@ def _get_with_retries(url, params, max_retries=MAX_RETRIES):
         except requests.RequestException as exc:
             last_exc = exc
             wait = RETRY_BACKOFF_SECONDS * attempt
+            logger.warning("Request failed (attempt %d/%d): %s. Retrying in %ss...", attempt, max_retries, exc, wait)
             time.sleep(wait)
-            
+
     raise RuntimeError(f"Failed to fetch {url} after {max_retries} attempts") from last_exc
 
 
@@ -50,13 +54,15 @@ def _safe_float(value):
     if value is None:
         return None
     try:
-        return float(value)
+        val = float(value)
+        return val if val > 0 else None
     except (TypeError, ValueError):
         return None
 
 
 def _run_upsert(table, columns, rows, conflict_cols):
     if not rows:
+        logger.warning("No rows to upsert into %s", table)
         return
     conn = get_conn()
     try:

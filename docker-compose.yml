@@ -1,3 +1,5 @@
+version: '3.8'
+
 x-airflow-common: &airflow-common
   image: apache/airflow:2.7.0
   restart: always
@@ -7,6 +9,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ""
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_FOLDER: "/opt/airflow/dags/git-sync/current"
+    EIA_API_KEY: "Ywlv9ChPz0AzigFBT9lGWsrRjwyOafGJlYD9QLvE"
+    EIA_BASE_URL: "https://api.eia.gov/v2"
   volumes:
     - airflow-dags-volume:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -56,14 +60,14 @@ services:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
       retries: 5
-     
-  # 3. Initialization Service (Initializes DB & Admin User then exits)
+
+  # 3. Initialization Service
   airflow-init:
     <<: *airflow-common
     restart: "no"
     command: >
       bash -c "airflow db init &&
-               airflow users create --username airflow --password airflow --firstname airflow --lastname airflow--role Admin --email admin@example.com || true"
+               airflow users create --username airflow --password airflow --firstname airflow --lastname airflow --role Admin --email admin@example.com || true"
     depends_on:
       postgres:
         condition: service_healthy

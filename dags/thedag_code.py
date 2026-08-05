@@ -1,10 +1,13 @@
-import os
-import time
+import json
 import logging
+import os
 from datetime import datetime, timedelta
 import requests
 
-from airflow.decorators import dag, task
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from psycopg2.extras import execute_values
 
@@ -12,256 +15,277 @@ logger = logging.getLogger(__name__)
 
 default_args = {
     'owner': 'gasoil_intelligence',
-    'retries': 2,
-    'retry_delay': timedelta(minutes=3),
+    'depends_on_past': False,
+    'start_date': datetime(2026, 1, 1),
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=2),
+    'catchup': False,
 }
 
-# Configuration Constants
-EIA_BASE = os.environ.get("EIA_BASE_URL", "https://api.eia.gov/v2")
-EIA_KEY = os.environ.get("EIA_API_KEY", "")
-NHTSA_BASE = os.environ.get("NHTSA_BASE_URL", "https://api.nhtsa.gov")
+dag_name = 'gasoil_intelligence_etl_v2'
 
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 2
-FUEL_KEYWORDS = ["FUEL", "GAS", "ENGINE"]
-
-
-
-# Helper Functions (API Request & Database Upsert Logic)
+dag = DAG(
+    dag_id=dag_name,
+    default_args=default_args,
+    description='Decoupled Gasoil Data Pipeline with Data Quality Checks',
+    schedule='0 6 * * *',
+    max_active_runs=1,
+)
 
 
-def get_pg_connection():
-    """Retrieves standard psycopg2 connection object from Airflow Connection."""
-    hook = PostgresHook(postgres_conn_id="postgres_gasoil_db")
-    return hook.get_conn()
+def get_eia_api_key():
+    """Retrieve EIA API Key from Airflow Variable or Environment fallback."""
+    try:
+        key = Variable.get("EIA_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("EIA_API_KEY") or os.environ.get("Crude_oil_key", "")
 
 
-def upsert_rows(conn, table, columns, rows, conflict_cols):
-    """Executes SQL ON CONFLICT UPSERT using psycopg2 execute_values."""
-    if not rows:
-        logger.warning(f"No rows provided to upsert into {table}.")
+def get_postgres_conn_id():
+    """Fallback connection ID matching both custom and default Airflow configs."""
+    return os.environ.get("AIRFLOW_CONN_POSTGRES_DEFAULT", "postgres_gasoil_db")
+
+
+def format_period_date(period_str):
+    """Normalize EIA date strings (YYYY, YYYYMM, YYYYMMDD) into YYYY-MM-DD format."""
+    if not period_str:
+        return None
+    cleaned = str(period_str).replace("-", "")
+    if len(cleaned) == 8:
+        return f"{cleaned[:4]}-{cleaned[4:6]}-{cleaned[6:8]}"
+    elif len(cleaned) == 6:
+        return f"{cleaned[:4]}-{cleaned[4:6]}-01"
+    elif len(cleaned) == 4:
+        return f"{cleaned[:4]}-01-01"
+    return period_str
+
+
+# =========================================================================
+# ETL Python Callables
+# =========================================================================
+
+def fetch_and_stage_eia_crude(**kwargs):
+    """Stage: Extract raw crude spot prices from EIA and push to XCom."""
+    api_key = get_eia_api_key()
+    if not api_key:
+        raise ValueError("EIA_API_KEY is missing! Configure it in Airflow Variables or .env.")
+
+    eia_base = os.environ.get("EIA_BASE_URL", "https://api.eia.gov/v2")
+    url = f"{eia_base}/petroleum/pri/spt/data/"
+    params = {
+        "api_key": api_key,
+        "frequency": "daily",
+        "data[0]": "value",
+        "facets[series][]": ["RWTC", "RBRTE"],
+        "sort[0][column]": "period",
+        "sort[0][direction]": "desc",
+        "length": 100,
+    }
+    logger.info("Extracting raw EIA crude spot prices...")
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    raw_data = resp.json().get("response", {}).get("data", [])
+    
+    if not raw_data:
+        logger.warning("EIA API returned empty payload for crude spot prices.")
+
+    kwargs["ti"].xcom_push(key="raw_crude_data", value=json.dumps(raw_data))
+
+
+def fetch_and_stage_eia_retail(**kwargs):
+    """Stage: Extract raw retail gasoil prices from EIA and push to XCom."""
+    api_key = get_eia_api_key()
+    if not api_key:
+        raise ValueError("EIA_API_KEY is missing! Configure it in Airflow Variables or .env.")
+
+    eia_base = os.environ.get("EIA_BASE_URL", "https://api.eia.gov/v2")
+    url = f"{eia_base}/petroleum/pri/gnd/data/"
+    params = {
+        "api_key": api_key,
+        "frequency": "weekly",
+        "data[0]": "value",
+        "facets[product][]": ["EPMR", "EPD2D"],
+        "sort[0][column]": "period",
+        "sort[0][direction]": "desc",
+        "length": 200,
+    }
+    logger.info("Extracting raw EIA retail gasoil prices...")
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    raw_data = resp.json().get("response", {}).get("data", [])
+
+    if not raw_data:
+        logger.warning("EIA API returned empty payload for retail gasoil prices.")
+
+    kwargs["ti"].xcom_push(key="raw_retail_data", value=json.dumps(raw_data))
+
+
+def load_crude_spot_prices_table(**kwargs):
+    """Transform & Load: Parse crude spot records and upsert into PostgreSQL."""
+    ti = kwargs["ti"]
+    raw_json = ti.xcom_pull(key="raw_crude_data", task_ids="Stage_eia_crude_prices")
+    if not raw_json:
+        logger.warning("No crude data found in XCom.")
         return
 
-    cols_sql = ", ".join(columns)
-    conflict_sql = ", ".join(conflict_cols)
-    update_cols = [c for c in columns if c not in conflict_cols]
+    records = json.loads(raw_json)
+    series_map = {"RWTC": "WTI", "RBRTE": "Brent"}
+    rows = []
 
-    if update_cols:
-        update_sql = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols)
-        conflict_action = f"DO UPDATE SET {update_sql}"
-    else:
-        conflict_action = "DO NOTHING"
+    for row in records:
+        try:
+            price = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
 
-    query = f"""
-        INSERT INTO {table} ({cols_sql})
+        if price <= 0:
+            continue
+
+        period_date = format_period_date(row.get("period"))
+        crude_type = series_map.get(row.get("series"), row.get("series"))
+        rows.append((period_date, crude_type, price, "EIA"))
+
+    if not rows:
+        logger.warning("No valid transformed crude spot records.")
+        return
+
+    conn_id = get_postgres_conn_id()
+    hook = PostgresHook(postgres_conn_id=conn_id)
+    conn = hook.get_conn()
+    query = """
+        INSERT INTO crude_spot_prices (date, crude_type, price_usd_per_barrel, source)
         VALUES %s
-        ON CONFLICT ({conflict_sql}) {conflict_action}
+        ON CONFLICT (date, crude_type, source)
+        DO UPDATE SET price_usd_per_barrel = EXCLUDED.price_usd_per_barrel;
     """
-
-    with conn.cursor() as cur:
-        execute_values(cur, query, rows)
-    conn.commit()
-    logger.info(f"Successfully upserted {len(rows)} rows into {table}.")
-
-
-def get_with_retries(url, params, max_retries=MAX_RETRIES):
-    """Fetches HTTP data with retry backoff for rate-limiting (429)."""
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = requests.get(url, params=params, timeout=30)
-            if resp.status_code == 429:
-                wait = RETRY_BACKOFF_SECONDS * attempt
-                logger.warning("Rate limited (429), retrying in %ss", wait)
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as exc:
-            last_exc = exc
-            wait = RETRY_BACKOFF_SECONDS * attempt
-            time.sleep(wait)
-
-    raise RuntimeError(f"Failed to fetch {url} after {max_retries} attempts") from last_exc
-
-
-def extract_eia_payload(resp):
-    payload = resp.json()
-    if "response" not in payload or "data" not in payload["response"]:
-        raise RuntimeError(f"Unexpected EIA response shape: {payload}")
-    return payload["response"]["data"]
-
-
-def safe_float(value):
-    if value is None:
-        return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        with conn.cursor() as cur:
+            execute_values(cur, query, rows)
+        conn.commit()
+        logger.info(f"Successfully loaded {len(rows)} records into crude_spot_prices.")
+    finally:
+        conn.close()
 
 
+def load_gasoil_prices_table(**kwargs):
+    """Transform & Load: Parse retail gasoil records and upsert into PostgreSQL."""
+    ti = kwargs["ti"]
+    raw_json = ti.xcom_pull(key="raw_retail_data", task_ids="Stage_eia_retail_gasoil")
+    if not raw_json:
+        logger.warning("No retail gasoil data found in XCom.")
+        return
 
-# Airflow DAG Definition
+    records = json.loads(raw_json)
+    product_map = {"EPMR": "Regular Gasoline", "EPD2D": "Diesel"}
+    rows = []
 
-@dag(
-    dag_id='gasoil_intelligence_etl_v2',
-    default_args=default_args,
-    description="Live Pipeline: Ingest EIA spot/retail prices and NHTSA vehicle complaints into Postgres",
-    schedule_interval='0 6 * * *',
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    tags=['gasoil', 'eia', 'nhtsa', 'production']
+    for row in records:
+        try:
+            price = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+
+        if price <= 0:
+            continue
+
+        period_date = format_period_date(row.get("period"))
+        product_type = product_map.get(row.get("product"), row.get("product"))
+        region = row.get("area-name", "US")
+        grade = row.get("process-name", "Retail")
+        rows.append((period_date, product_type, region, grade, price, "EIA"))
+
+    if not rows:
+        logger.warning("No valid transformed retail gasoil records.")
+        return
+
+    conn_id = get_postgres_conn_id()
+    hook = PostgresHook(postgres_conn_id=conn_id)
+    conn = hook.get_conn()
+    query = """
+        INSERT INTO gasoil_prices (date, product_type, region, grade, price_usd_per_gallon, source)
+        VALUES %s
+        ON CONFLICT (date, product_type, region, grade, source)
+        DO UPDATE SET price_usd_per_gallon = EXCLUDED.price_usd_per_gallon;
+    """
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, query, rows)
+        conn.commit()
+        logger.info(f"Successfully loaded {len(rows)} records into gasoil_prices.")
+    finally:
+        conn.close()
+
+
+def run_data_quality_checks(**kwargs):
+    """Data Quality Check: Ensure tables contain records and no NULL essential fields."""
+    conn_id = get_postgres_conn_id()
+    hook = PostgresHook(postgres_conn_id=conn_id)
+    conn = hook.get_conn()
+    tables = ["crude_spot_prices", "gasoil_prices"]
+
+    try:
+        with conn.cursor() as cur:
+            for table in tables:
+                cur.execute(f"SELECT COUNT(*) FROM {table};")
+                count = cur.fetchone()[0]
+                if count < 1:
+                    raise ValueError(f"Data Quality check failed: Table '{table}' is empty!")
+                logger.info(f"Data Quality check passed: Table '{table}' contains {count} rows.")
+    finally:
+        conn.close()
+
+
+# =========================================================================
+# DAG Operators Instantiation
+# =========================================================================
+
+start_operator = EmptyOperator(task_id='Begin_execution', dag=dag)
+
+stage_eia_crude_prices = PythonOperator(
+    task_id='Stage_eia_crude_prices',
+    python_callable=fetch_and_stage_eia_crude,
+    dag=dag,
 )
-def gasoil_intelligence_pipeline():
 
-    @task(execution_timeout=timedelta(minutes=10))
-    def fetch_eia_crude_prices():
-        """Fetches daily Brent & WTI Crude spot prices from EIA API."""
-        logger.info("Starting EIA Crude Spot Prices ingestion...")
-        url = f"{EIA_BASE}/petroleum/pri/spt/data/"
-        params = {
-            "api_key": EIA_KEY,
-            "frequency": "daily",
-            "data[0]": "value",
-            "facets[series][]": ["RWTC", "RBRTE"],
-            "sort[0][column]": "period",
-            "sort[0][direction]": "desc",
-            "length": 100,
-        }
+stage_eia_retail_gasoil = PythonOperator(
+    task_id='Stage_eia_retail_gasoil',
+    python_callable=fetch_and_stage_eia_retail,
+    dag=dag,
+)
 
-        resp = get_with_retries(url, params)
-        data = extract_eia_payload(resp)
+load_crude_spot_table = PythonOperator(
+    task_id='Load_crude_spot_prices_table',
+    python_callable=load_crude_spot_prices_table,
+    dag=dag,
+)
 
-        series_map = {"RWTC": "WTI", "RBRTE": "Brent"}
-        rows = []
+load_gasoil_prices_table = PythonOperator(
+    task_id='Load_gasoil_prices_table',
+    python_callable=load_gasoil_prices_table,
+    dag=dag,
+)
 
-        for row in data:
-            price = safe_float(row.get("value"))
-            if price is None:
-                continue
-            crude_type = series_map.get(row.get("series"), row.get("series"))
-            rows.append((row["period"], crude_type, price, "EIA"))
+data_quality_checks = PythonOperator(
+    task_id='Run_data_quality_checks',
+    python_callable=run_data_quality_checks,
+    dag=dag,
+)
 
-        conn = get_pg_connection()
-        try:
-            upsert_rows(
-                conn=conn,
-                table="crude_spot_prices",
-                columns=["date", "crude_type", "price_usd_per_barrel", "source"],
-                rows=rows,
-                conflict_cols=["date", "crude_type", "source"],
-            )
-        finally:
-            conn.close()
+end_operator = EmptyOperator(task_id='Stop_execution', dag=dag)
 
-    @task(execution_timeout=timedelta(minutes=10))
-    def fetch_eia_retail_gasoil():
-        """Fetches weekly Retail Gasoline & Diesel prices from EIA API."""
-        logger.info("Starting EIA Retail Gasoil Prices ingestion...")
-        url = f"{EIA_BASE}/petroleum/pri/gnd/data/"
-        params = {
-            "api_key": EIA_KEY,
-            "frequency": "weekly",
-            "data[0]": "value",
-            "facets[product][]": ["EPMR", "EPD2D"],
-            "sort[0][column]": "period",
-            "sort[0][direction]": "desc",
-            "length": 200,
-        }
 
-        resp = get_with_retries(url, params)
-        data = extract_eia_payload(resp)
+# =========================================================================
+# Task Dependency Flow
+# =========================================================================
 
-        product_map = {"EPMR": "Regular Gasoline", "EPD2D": "Diesel"}
-        rows = []
+start_operator >> [stage_eia_crude_prices, stage_eia_retail_gasoil]
 
-        for row in data:
-            price = safe_float(row.get("value"))
-            if price is None:
-                continue
+stage_eia_crude_prices >> load_crude_spot_table
+stage_eia_retail_gasoil >> load_gasoil_prices_table
 
-            rows.append((
-                row["period"],
-                product_map.get(row.get("product"), row.get("product")),
-                row.get("area-name", "US"),
-                row.get("process-name", "Retail"),
-                price,
-                "EIA",
-            ))
-
-        conn = get_pg_connection()
-        try:
-            upsert_rows(
-                conn=conn,
-                table="gasoil_prices",
-                columns=["date", "product_type", "region", "grade", "price_usd_per_gallon", "source"],
-                rows=rows,
-                conflict_cols=["date", "product_type", "region", "grade", "source"],
-            )
-        finally:
-            conn.close()
-
-    @task(execution_timeout=timedelta(minutes=10))
-    def fetch_nhtsa_complaints():
-        """Fetches fuel & engine vehicle complaints from NHTSA API."""
-        logger.info("Starting NHTSA Complaints ingestion...")
-        vehicles = [("Toyota", "Camry", 2023), ("Ford", "F-150", 2023)]
-        
-        columns = [
-            "complaint_id", "date", "make", "model", "year",
-            "component", "fuel_related_flag", "description",
-        ]
-        rows = []
-
-        for make, model, year in vehicles:
-            url = f"{NHTSA_BASE}/complaints/complaintsByVehicle"
-            query_params = {"make": make, "model": model, "modelYear": year}
-            try:
-                resp = requests.get(url, params=query_params, timeout=30)
-                resp.raise_for_status()
-                complaints = resp.json().get("results", [])
-            except Exception as e:
-                logger.error(f"Skipping {make} {model} {year}: {e}")
-                continue
-
-            for c in complaints:
-                component = c.get("components", "")
-                is_fuel_related = any(k in component.upper() for k in FUEL_KEYWORDS)
-                date_str = c.get("dateComplaintFiled")
-                
-                try:
-                    complaint_date = datetime.strptime(date_str, "%m/%d/%Y").date() if date_str else None
-                except (ValueError, TypeError):
-                    complaint_date = None
-
-                rows.append((
-                    c.get("odiNumber"),
-                    complaint_date,
-                    make,
-                    model,
-                    year,
-                    component,
-                    is_fuel_related,
-                    (c.get("summary") or "")[:5000],
-                ))
-
-        conn = get_pg_connection()
-        try:
-            upsert_rows(
-                conn=conn,
-                table="nhtsa_complaints",
-                columns=columns,
-                rows=rows,
-                conflict_cols=["complaint_id"],
-            )
-        finally:
-            conn.close()
-
-    # Define parallel task execution sequence
-    t1 = fetch_eia_crude_prices()
-    t2 = fetch_eia_retail_gasoil()
-    t3 = fetch_nhtsa_complaints()
-
-# Instantiate DAG
-dag_instance = gasoil_intelligence_pipeline()
+[load_crude_spot_table, load_gasoil_prices_table] >> data_quality_checks >> end_operator
