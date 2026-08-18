@@ -30,7 +30,7 @@ dag = DAG(
     dag_id=dag_name,
     default_args=default_args,
     description='Decoupled Gasoil Data Pipeline with Data Quality Checks',
-    schedule='0 6 * * *',
+    schedule='0 6 * * *',#exectution tous les jours at 6am
     max_active_runs=1,
 )
 
@@ -52,22 +52,22 @@ def get_postgres_conn_id():
 
 
 def format_period_date(period_str):
-    """Normalize EIA date strings (YYYY, YYYYMM, YYYYMMDD) into YYYY-MM-DD format."""
+    #Normalisation des dates recupérés par EIA api en une forme de [yyyy-mm-dd]
     if not period_str:
         return None
-    cleaned = str(period_str).replace("-", "")
+    cleaned = str(period_str).replace("-", "")#on enleve les tirets et on convertie en str en ajoutant les ''
     if len(cleaned) == 8:
         return f"{cleaned[:4]}-{cleaned[4:6]}-{cleaned[6:8]}"
     elif len(cleaned) == 6:
         return f"{cleaned[:4]}-{cleaned[4:6]}-01"
     elif len(cleaned) == 4:
         return f"{cleaned[:4]}-01-01"
-    return period_str
+    return period_str#si par exemple c'est nulle on retourne la valeur d'origine
 
 
-# =========================================================================
+
 # ETL Python Callables
-# =========================================================================
+
 
 def fetch_and_stage_eia_crude(**kwargs):
     """Stage: Extract raw crude spot prices from EIA and push to XCom."""
@@ -86,19 +86,22 @@ def fetch_and_stage_eia_crude(**kwargs):
         "sort[0][direction]": "desc",
         "length": 100,
     }
-    logger.info("Extracting raw EIA crude spot prices...")
+    #TRACER L EXECUTION DANS LES LOGS D AIRFLOW
+    logger.info("Extracting raw EIA crude spot prices")
     resp = requests.get(url, params=params, timeout=30)
+    #SI LE CODE STATUT EST CLIENT ERROR OU SERVER ERROR DONC ON LEVE HTTP ERROR
     resp.raise_for_status()
+    #res
     raw_data = resp.json().get("response", {}).get("data", [])
     
     if not raw_data:
         logger.warning("EIA API returned empty payload for crude spot prices.")
 
     kwargs["ti"].xcom_push(key="raw_crude_data", value=json.dumps(raw_data))
-
+#kwargs[ti]:récupere l'ibjet TaskInstance injecté par airflow 
 
 def fetch_and_stage_eia_retail(**kwargs):
-    """Stage: Extract raw retail gasoil prices from EIA and push to XCom."""
+    #Extract prices from EIA and push to XCom
     api_key = get_eia_api_key()
     if not api_key:
         raise ValueError("EIA_API_KEY is missing! Configure it in Airflow Variables or .env.")
@@ -173,7 +176,7 @@ def load_crude_spot_prices_table(**kwargs):
 
 
 def load_gasoil_prices_table(**kwargs):
-    """Transform & Load: Parse retail gasoil records and upsert into PostgreSQL."""
+    #Parse retail gasoil records and upsert into PostgreSQL
     ti = kwargs["ti"]
     raw_json = ti.xcom_pull(key="raw_retail_data", task_ids="Stage_eia_retail_gasoil")
     if not raw_json:
@@ -240,9 +243,9 @@ def run_data_quality_checks(**kwargs):
         conn.close()
 
 
-# =========================================================================
+
 # DAG Operators Instantiation
-# =========================================================================
+
 
 start_operator = EmptyOperator(task_id='Begin_execution', dag=dag)
 
@@ -279,9 +282,9 @@ data_quality_checks = PythonOperator(
 end_operator = EmptyOperator(task_id='Stop_execution', dag=dag)
 
 
-# =========================================================================
+
 # Task Dependency Flow
-# =========================================================================
+
 
 start_operator >> [stage_eia_crude_prices, stage_eia_retail_gasoil]
 

@@ -3,9 +3,9 @@ import os
 import time
 import requests
 from dotenv import load_dotenv
+import json  
 from database import get_conn, upsert
 
-# Load .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
 load_dotenv(dotenv_path)
 
@@ -145,6 +145,39 @@ def fetch_gasoil_retail_prices():
     )
 
 
+def export_to_jsonl(filename="train.jsonl"):
+    """Récupère les prix de la base de données et les exporte au format JSONL pour Mistral AI."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    
+    
+    cursor.execute("SELECT date, product_type, region, price_usd_per_gallon FROM gasoil_prices ORDER BY date DESC LIMIT 200;")
+    rows = cursor.fetchall()
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        for row in rows:
+            date, product_type, region, price = row
+            
+            # Formulation naturelle des Q/A pour l'entraînement du LLM
+            question = f"Quel était le prix du {product_type} dans la région {region} à la date du {date} ?"
+            reponse = f"Le prix du {product_type} dans la région {region} le {date} était de {price} USD par gallon."
+            
+            # Structure Mistral AI
+            structure_mistral = {
+                "messages": [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": price} 
+                ]
+            }
+           
+            f.write(json.dumps(structure_mistral, ensure_ascii=False) + "\n")
+            
+    cursor.close()
+    conn.close()
+    logger.info("Données exportées avec succès dans %s au format JSONL", filename)
+
+
 if __name__ == "__main__":
     fetch_crude_spot_prices()
     fetch_gasoil_retail_prices()
+    export_to_jsonl()
