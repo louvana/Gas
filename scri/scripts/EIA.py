@@ -144,12 +144,10 @@ def fetch_gasoil_retail_prices():
         conflict_cols=["date", "product_type", "region", "grade", "source"],
     )
 
-
 def export_to_jsonl(filename="train.jsonl"):
     """Récupère les prix de la base de données et les exporte au format JSONL pour Mistral AI."""
     conn = get_conn()
     cursor = conn.cursor()
-    
     
     cursor.execute("SELECT date, product_type, region, price_usd_per_gallon FROM gasoil_prices ORDER BY date DESC LIMIT 200;")
     rows = cursor.fetchall()
@@ -158,23 +156,23 @@ def export_to_jsonl(filename="train.jsonl"):
         for row in rows:
             date, product_type, region, price = row
             
-            # Formulation naturelle des Q/A pour l'entraînement du LLM
             question = f"Quel était le prix du {product_type} dans la région {region} à la date du {date} ?"
             reponse = f"Le prix du {product_type} dans la région {region} le {date} était de {price} USD par gallon."
             
-            # Structure Mistral AI
             structure_mistral = {
                 "messages": [
                     {"role": "user", "content": question},
-                    {"role": "assistant", "content": price} 
+                    {"role": "assistant", "content": reponse}  # Corrected from `price`
                 ]
             }
-           
+            
             f.write(json.dumps(structure_mistral, ensure_ascii=False) + "\n")
             
     cursor.close()
     conn.close()
     logger.info("Données exportées avec succès dans %s au format JSONL", filename)
+
+   
 
 
 if __name__ == "__main__":

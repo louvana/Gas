@@ -24,7 +24,7 @@ default_args = {
     'catchup': False,
 }
 
-dag_name = 'gasoil_intelligence_etl_v2'
+dag_name = 'gasoil_intelligence_ETL'
 
 dag = DAG(
     dag_id=dag_name,
@@ -70,10 +70,10 @@ def format_period_date(period_str):
 
 
 def fetch_and_stage_eia_crude(**kwargs):
-    """Stage: Extract raw crude spot prices from EIA and push to XCom."""
+    """Stage: Extract raw crude spot prices from EIA """
     api_key = get_eia_api_key()
     if not api_key:
-        raise ValueError("EIA_API_KEY is missing! Configure it in Airflow Variables or .env.")
+        raise ValueError("EIA_API_KEY is missing")
 
     eia_base = os.environ.get("EIA_BASE_URL", "https://api.eia.gov/v2")
     url = f"{eia_base}/petroleum/pri/spt/data/"
@@ -94,12 +94,11 @@ def fetch_and_stage_eia_crude(**kwargs):
     #res
     raw_data = resp.json().get("response", {}).get("data", [])
     
-    if not raw_data:
+    if not raw_data:#verification si les données sont bien scrapés ou non
         logger.warning("EIA API returned empty payload for crude spot prices.")
 
     kwargs["ti"].xcom_push(key="raw_crude_data", value=json.dumps(raw_data))
-#kwargs[ti]:récupere l'ibjet TaskInstance injecté par airflow 
-
+#kwargs[ti]:récupere l'objet TaskInstance injecté par airflow 
 def fetch_and_stage_eia_retail(**kwargs):
     #Extract prices from EIA and push to XCom
     api_key = get_eia_api_key()
@@ -126,6 +125,7 @@ def fetch_and_stage_eia_retail(**kwargs):
         logger.warning("EIA API returned empty payload for retail gasoil prices.")
 
     kwargs["ti"].xcom_push(key="raw_retail_data", value=json.dumps(raw_data))
+
 
 
 def load_crude_spot_prices_table(**kwargs):
